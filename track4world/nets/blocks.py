@@ -97,20 +97,16 @@ def bilinear_sampler(
     if normalize_coords:
         # Calculate normalization factors based on input shape
         shape_rev = reversed(input.shape[2:])
-        device = coords.device
-        
         if align_corners:
             # Normalize coordinates from [0, W/H - 1] to [-1, 1].
-            size_tensor = torch.tensor(
-                [2 / max(size - 1, 1) for size in shape_rev], 
-                device=device
+            size_tensor = coords.new_tensor(
+                [2 / max(size - 1, 1) for size in shape_rev]
             )
             coords = coords * size_tensor - 1
         else:
             # Normalize coordinates from [0, W/H] to [-1, 1].
-            size_tensor = torch.tensor(
-                [2 / size for size in shape_rev], 
-                device=device
+            size_tensor = coords.new_tensor(
+                [2 / size for size in shape_rev]
             )
             coords = coords * size_tensor - 1
             

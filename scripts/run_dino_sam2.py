@@ -27,9 +27,14 @@ from tqdm import tqdm
 """
 Hyper parameters
 """
-parser = argparse.ArgumentParser(description="Process a single video with Grounded SAM 2")
-parser.add_argument('--video-path', required=True, 
-help="Path to the input video file (mp4, avi) or directory of frames")
+parser = argparse.ArgumentParser(
+    description="Process a video, image, or RGB image directory with Grounded SAM 2"
+)
+parser.add_argument(
+    '--input-path', '--video-path', '--rgb-dir',
+    dest='input_path', required=True,
+    help="Path to a video, a single image, or an ordered RGB image directory"
+)
 parser.add_argument('--text-prompt', required=True, 
 help="Text prompts for detection, e.g., 'car. person. dog'")
 parser.add_argument('--grounding-model', default="IDEA-Research/grounding-dino-base")
@@ -39,11 +44,29 @@ parser.add_argument("--output-dir", default="output_single_video", help="Directo
 parser.add_argument("--force-cpu", action="store_true")
 parser.add_argument("--box-threshold", type=float, default=0.25)
 parser.add_argument("--text-threshold", type=float, default=0.25)
+parser.add_argument(
+    "--max-frames", type=int, default=0,
+    help="Maximum number of frames/images to process; 0 means all"
+)
+parser.add_argument(
+    "--preserve-source-names", action="store_true",
+    help=(
+        "Keep source image stems for output files. By default outputs use "
+        "zero-based sequential names (00000.png, 00001.png, ...), which are "
+        "compatible with the 3D-FF input loader."
+    )
+)
 args = parser.parse_args()
+if args.max_frames < 0:
+    parser.error("--max-frames must be greater than or equal to 0")
+
+input_path = Path(args.input_path)
+if not input_path.exists():
+    parser.error(f"input path does not exist: {input_path}")
 
 # Constants
 GROUNDING_MODEL = args.grounding_model
-VIDEO_PATH = args.video_path
+INPUT_PATH = input_path
 TEXT_PROMPT = args.text_prompt
 SAM2_CHECKPOINT = args.sam2_checkpoint
 SAM2_MODEL_CONFIG = args.sam2_model_config
@@ -64,7 +87,7 @@ output_path_mask.mkdir(parents=True, exist_ok=True)
 # use bfloat16
 torch.autocast(device_type=DEVICE, dtype=torch.bfloat16).__enter__()
 
-if torch.cuda.get_device_properties(0).major >= 8:
+if DEVICE == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -85,65 +108,94 @@ def id_to_colors(id): # id to color
         id = id // 256
     return rgb
 
-# Generate random color mapping
-idx_to_id = [i for i in range(256*256*256)]
-np.random.shuffle(idx_to_id) 
+IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 
-def get_frames_generator(source_path):
+
+def get_frames_generator(source_path, max_frames=0):
     """
-    Yields frames from a video file or a directory of images.
-    Returns: (frame_name, frame_rgb_numpy, original_pil_image)
+    Yields frames from a video, a single image, or an image directory.
+    Returns: (frame_index, source_name, frame_rgb_numpy, original_pil_image)
     """
-    if os.path.isdir(source_path):
-        print(f"Processing directory: {source_path}")
-        files = sorted([f for f in os.listdir(source_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        for filename in files:
-            full_path = os.path.join(source_path, filename)
-            image_pil = Image.open(full_path).convert("RGB")
-            yield filename, np.array(image_pil), image_pil
-    else:
-        print(f"Processing video file: {source_path}")
-        cap = cv2.VideoCapture(source_path)
-        if not cap.isOpened():
-            raise IOError(f"Cannot open video: {source_path}")
-        
-        frame_idx = 0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
+    source = Path(source_path)
+    frame_limit = max_frames if max_frames > 0 else None
+
+    if source.is_dir():
+        image_paths = sorted(
+            path for path in source.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        )
+        if frame_limit is not None:
+            image_paths = image_paths[:frame_limit]
+        if not image_paths:
+            raise ValueError(f"No supported images found in: {source}")
+
+        print(f"Processing image directory: {source} ({len(image_paths)} images)")
+        for frame_idx, image_path in enumerate(
+            tqdm(image_paths, desc="Processing Images")
+        ):
+            with Image.open(image_path) as source_image:
+                image_pil = source_image.convert("RGB")
+            yield frame_idx, image_path.name, np.array(image_pil), image_pil
+        return
+
+    if source.is_file() and source.suffix.lower() in IMAGE_SUFFIXES:
+        print(f"Processing single image: {source}")
+        with Image.open(source) as source_image:
+            image_pil = source_image.convert("RGB")
+        yield 0, source.name, np.array(image_pil), image_pil
+        return
+
+    print(f"Processing video file: {source}")
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {source}")
+
+    frame_idx = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frame_limit is not None:
+        total_frames = min(total_frames, frame_limit)
+
+    try:
         with tqdm(total=total_frames, desc="Processing Frames") as pbar:
-            while True:
+            while frame_limit is None or frame_idx < frame_limit:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Convert BGR (OpenCV) to RGB
+
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image_pil = Image.fromarray(frame_rgb)
-                
-                # Create a filename for saving
-                frame_name = f"{frame_idx:05d}.jpg"
-                
-                yield frame_name, frame_rgb, image_pil
-                
+                source_name = f"{frame_idx:05d}.jpg"
+                yield frame_idx, source_name, frame_rgb, image_pil
+
                 frame_idx += 1
                 pbar.update(1)
+    finally:
         cap.release()
 
 # --- Main Processing Loop ---
 
 print(f"Starting inference with prompt: '{TEXT_PROMPT}'")
 
-frame_generator = get_frames_generator(VIDEO_PATH)
+frame_generator = get_frames_generator(INPUT_PATH, max_frames=args.max_frames)
+frame_manifest = []
 
-# Use tqdm if processing a directory (video file handles its own tqdm inside generator)
-if os.path.isdir(VIDEO_PATH):
-    frame_generator = tqdm(frame_generator, desc="Processing Frames")
-
-for image_file, image, image_pil in frame_generator:
+for frame_idx, source_name, image, image_pil in frame_generator:
+    output_stem = (
+        Path(source_name).stem
+        if args.preserve_source_names
+        else f"{frame_idx:05d}"
+    )
+    vis_name = f"{output_stem}.png"
+    png_name = f"{output_stem}.png"
+    json_name = f"{output_stem}.json"
+    frame_manifest.append({
+        "frame_index": frame_idx,
+        "source_name": source_name,
+        "mask_name": png_name,
+    })
     
-    # --- CHANGE 2: Convert to BGR and save original frame immediately ---
+    # Convert to BGR for OpenCV visualization output.
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    # cv2.imwrite(str(output_path_color / image_file), img_bgr)
 
     # 1. Prepare SAM2
     sam2_predictor.set_image(image)
@@ -231,11 +283,12 @@ for image_file, image, image_pil in frame_generator:
 
         for idx in sorted_mask_idx:
             m = masks_final[idx]
-            # Use random color map logic from original script
-            color_mask[m] = id_to_colors(idx_to_id[idx])
+            # Reserve zero for the static/background region.
+            object_id = int(idx) + 1
+            color_mask[m] = id_to_colors(object_id)
 
             obj_info_json.append({
-                "id": idx_to_id[idx],
+                "id": object_id,
                 "label": class_names[labels_final[idx]],
                 "score": float(detections.confidence[idx]),
             })
@@ -243,12 +296,9 @@ for image_file, image, image_pil in frame_generator:
         color_mask_bgr = cv2.cvtColor(color_mask, cv2.COLOR_RGB2BGR)
 
         # Save Visualizations
-        cv2.imwrite(str(output_path_vis / image_file), annotated_frame)
-        
+        cv2.imwrite(str(output_path_vis / vis_name), annotated_frame)
+
         # Save Masks (PNG + JSON)
-        png_name = os.path.splitext(image_file)[0] + ".png"
-        json_name = os.path.splitext(image_file)[0] + ".json"
-        
         cv2.imwrite(str(output_path_mask / png_name), color_mask_bgr)
         with open(output_path_mask / json_name, "w") as f:
             json.dump(obj_info_json, f)
@@ -256,13 +306,13 @@ for image_file, image, image_pil in frame_generator:
     else:
         # No detections
         # img_bgr is already defined at the top of the loop
-        cv2.imwrite(str(output_path_vis / image_file), img_bgr)
-        
-        png_name = os.path.splitext(image_file)[0] + ".png"
-        json_name = os.path.splitext(image_file)[0] + ".json"
-        
+        cv2.imwrite(str(output_path_vis / vis_name), img_bgr)
+
         cv2.imwrite(str(output_path_mask / png_name), np.zeros(image.shape, dtype=np.uint8))
         with open(output_path_mask / json_name, "w") as f:
             json.dump([], f)
+
+with open(OUTPUT_DIR / "frame_manifest.json", "w") as f:
+    json.dump(frame_manifest, f, indent=2)
 
 print(f"Processing complete. Results saved to {OUTPUT_DIR}")
